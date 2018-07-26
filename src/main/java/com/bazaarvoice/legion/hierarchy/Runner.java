@@ -4,12 +4,8 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.LoggerContext;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.ConsoleAppender;
-import com.bazaarvoice.legion.hierarchy.model.ChildIdSet;
-import com.bazaarvoice.legion.hierarchy.model.ChildTransition;
 import com.bazaarvoice.legion.hierarchy.model.HierarchySerdes;
 import com.bazaarvoice.legion.hierarchy.model.Lineage;
-import com.bazaarvoice.legion.hierarchy.model.LineageTransition;
-import com.bazaarvoice.legion.hierarchy.model.ParentTransition;
 import net.manub.embeddedkafka.EmbeddedKafka$;
 import net.manub.embeddedkafka.EmbeddedKafkaConfig;
 import org.apache.kafka.clients.admin.AdminClient;
@@ -27,21 +23,10 @@ import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.KafkaFuture;
 import org.apache.kafka.common.config.TopicConfig;
 import org.apache.kafka.common.errors.TopicExistsException;
-import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
-import org.apache.kafka.streams.Consumed;
 import org.apache.kafka.streams.KafkaStreams;
-import org.apache.kafka.streams.KeyValue;
-import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.StreamsConfig;
-import org.apache.kafka.streams.Topology;
-import org.apache.kafka.streams.kstream.KStream;
-import org.apache.kafka.streams.kstream.KTable;
-import org.apache.kafka.streams.kstream.KeyValueMapper;
-import org.apache.kafka.streams.kstream.Materialized;
-import org.apache.kafka.streams.kstream.Produced;
-import org.apache.kafka.streams.kstream.Serialized;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import scala.Tuple2;
@@ -55,8 +40,6 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
-import java.util.Optional;
 import java.util.Properties;
 import java.util.Scanner;
 import java.util.UUID;
@@ -69,11 +52,6 @@ import java.util.stream.Collectors;
 public class Runner {
 
     private final static Logger _log = LoggerFactory.getLogger(Runner.class);
-
-    // Want to distinguish root categories from those where the parent is unknown (null)
-    private final static String ROOT = "__root__";
-    // Used in instances where the parent is undefined.
-    private final static String UNDEF = "__undef__";
 
     public static void main(String args[]) {
 
@@ -91,15 +69,20 @@ public class Runner {
         EmbeddedKafka$.MODULE$.withRunningKafka(() -> {
             try (AdminClient adminClient = runner.createAdminClient(bootstrapServers)) {
 
-                runner.createTopics(adminClient);
-                KafkaStreams streams = new KafkaStreams(runner.createToplogy(), runner.createConfig(bootstrapServers));
+                HierarchyStreamConfig hierarchyStreamConfig = new HierarchyStreamConfig(
+                        "source", "child-parent-transition", "parent-child-transition", "children", "destination"
+                );
+
+                runner.createTopics(adminClient, hierarchyStreamConfig);
+                KafkaStreams streams = new KafkaStreams(new TopologyGenerator().createTopology(hierarchyStreamConfig), runner.createConfig(bootstrapServers));
                 streams.setUncaughtExceptionHandler((t, e) -> _log.error("Something failed", e));
                 streams.start();
                 _log.info("Streams started...");
 
                 final ExecutorService service = Executors.newCachedThreadPool();
-                runner.pollLineageTopic(service, bootstrapServers);
-                runner.startInteractiveHierarchyInput(service, bootstrapServers);
+                runner.pollDestinationTopic(service, hierarchyStreamConfig.getDestTopic(), bootstrapServers);
+                runner.startInteractiveHierarchyInput(service, hierarchyStreamConfig.getSourceTopic(),
+                        hierarchyStreamConfig.getDestTopic(), bootstrapServers);
 
                 Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                     streams.close();
@@ -135,7 +118,7 @@ public class Runner {
         rootLogger.setLevel(Level.WARN);
         rootLogger.setAdditive(true);
 
-        ch.qos.logback.classic.Logger runnerLogger = loggerContext.getLogger(Runner.class);
+        ch.qos.logback.classic.Logger runnerLogger = loggerContext.getLogger("com.bazaarvoice");
         runnerLogger.addAppender(outAppender);
         runnerLogger.setLevel(Level.INFO);
         runnerLogger.setAdditive(true);
@@ -179,15 +162,15 @@ public class Runner {
         return AdminClient.create(props);
     }
 
-    private void createTopics(AdminClient adminClient) {
+    private void createTopics(AdminClient adminClient, HierarchyStreamConfig hierarchyStreamConfig) {
         List<NewTopic> topics = new ArrayList<>();
 
         Map<String, String> topicCompaction = new LinkedHashMap<>();
-        topicCompaction.put("child-parent", TopicConfig.CLEANUP_POLICY_COMPACT);
-        topicCompaction.put("child-parent-transition", TopicConfig.CLEANUP_POLICY_COMPACT);
-        topicCompaction.put("parent-child-transition", TopicConfig.CLEANUP_POLICY_DELETE);
-        topicCompaction.put("parent-children", TopicConfig.CLEANUP_POLICY_COMPACT);
-        topicCompaction.put("lineage", TopicConfig.CLEANUP_POLICY_COMPACT);
+        topicCompaction.put(hierarchyStreamConfig.getSourceTopic(), TopicConfig.CLEANUP_POLICY_COMPACT);
+        topicCompaction.put(hierarchyStreamConfig.getParentTransitionTopic(), TopicConfig.CLEANUP_POLICY_COMPACT);
+        topicCompaction.put(hierarchyStreamConfig.getChildTransitionTopic(), TopicConfig.CLEANUP_POLICY_DELETE);
+        topicCompaction.put(hierarchyStreamConfig.getParentChildrenTopic(), TopicConfig.CLEANUP_POLICY_COMPACT);
+        topicCompaction.put(hierarchyStreamConfig.getDestTopic(), TopicConfig.CLEANUP_POLICY_COMPACT);
 
         for (Map.Entry<String, String> entry : topicCompaction.entrySet()) {
             String topicName = entry.getKey();
@@ -219,93 +202,15 @@ public class Runner {
             }
         }         
     }
-    
-    private Topology createToplogy() {
 
-        StreamsBuilder builder = new StreamsBuilder();
-
-        KTable<String, String> childParentTable = builder.table(
-                "child-parent", Consumed.with(Serdes.String(), Serdes.String()));
-
-        KTable<String, ParentTransition> childParentTransitionTable = builder.table(
-                "child-parent-transition", Consumed.with(Serdes.String(), HierarchySerdes.ParentTransition()));
-
-        KStream<String, ChildTransition> parentChildTransitionStream = builder.stream(
-                "parent-child-transition", Consumed.with(Serdes.String(), HierarchySerdes.ChildTransition()));
-
-        KTable<String, ChildIdSet> parentChildrenTable = builder.table(
-                "parent-children", Consumed.with(Serdes.String(), HierarchySerdes.ChildIdSet()));
-
-        KTable<String, Lineage> lineageTable = builder.table(
-                "lineage", Consumed.with(Serdes.String(), HierarchySerdes.Lineage()));
-        
-        childParentTable
-                .toStream()
-                .leftJoin(
-                        childParentTransitionTable,
-                        (newParentId, priorTransition) -> new ParentTransition(
-                                Optional.ofNullable(priorTransition).map(ParentTransition::getNewParentId).orElse(null),
-                                parentOrRoot(newParentId)))
-                .filter((child, parentTransition) -> !Objects.equals(parentTransition.getOldParentId(), parentTransition.getNewParentId()))
-                .to("child-parent-transition", Produced.with(Serdes.String(), HierarchySerdes.ParentTransition()));
-
-        childParentTransitionTable
-                .toStream()
-                .flatMap((KeyValueMapper<String, ParentTransition, Iterable<? extends KeyValue<String, ChildTransition>>>) (childId, parentTransition) -> {
-                    List<KeyValue<String, ChildTransition>> transitions = new ArrayList<>(2);
-                    if (parentTransition.getOldParentId() != null) {
-                        transitions.add(new KeyValue<>(parentTransition.getOldParentId(), new ChildTransition(childId, false)));
-                    }
-                    transitions.add(new KeyValue<>(parentTransition.getNewParentId(), new ChildTransition(childId, true)));
-                    return transitions;
-                })
-                .to("parent-child-transition", Produced.with(Serdes.String(), HierarchySerdes.ChildTransition()));
-        
-        // Root parents
-        parentChildTransitionStream
-                .filter((id, transition) -> isRoot(id) && transition.isAdd())
-                .map((id, transition) -> new KeyValue<>(transition.getChildId(), Lineage.EMPTY))
-                .to("lineage", Produced.with(Serdes.String(), HierarchySerdes.Lineage()));
-
-        // Parents which don't yet exist
-        parentChildTransitionStream
-                .leftJoin(childParentTable, (childTransition, maybeParent) -> maybeParent != null)
-                .filter((id, exists) -> !(exists || isRoot(id)))
-                .map((id, ignore) -> new KeyValue<>(id, new Lineage(UNDEF)))
-                .to("lineage", Produced.with(Serdes.String(), HierarchySerdes.Lineage()));
-
-        parentChildTransitionStream
-                .groupByKey(Serialized.with(Serdes.String(), HierarchySerdes.ChildTransition()))
-                .aggregate(
-                        () -> ChildIdSet.EMPTY,
-                        (key, t, idSet) -> idSet.withUpdate(t.getChildId(), t.isAdd()),
-                        Materialized.with(Serdes.String(), HierarchySerdes.ChildIdSet()))
-                .toStream()
-                .to("parent-children", Produced.with(Serdes.String(), HierarchySerdes.ChildIdSet()));
-
-        parentChildrenTable
-                .join(lineageTable, (children, lineage) -> new LineageTransition(lineage.getLinage(), children.children()))
-                .toStream()
-                .flatMap((KeyValueMapper<String, LineageTransition, Iterable<? extends KeyValue<String, Lineage>>>) (id, lineageTransition) -> {
-                    List<String> updatedLinage = new ArrayList<>(lineageTransition.getParentLineage());
-                    updatedLinage.add(id);
-                    return lineageTransition.getChildren().stream()
-                            .map(childId -> new KeyValue<>(childId, new Lineage(updatedLinage)))
-                            .collect(Collectors.toList());
-                })
-                .to("lineage", Produced.with(Serdes.String(), HierarchySerdes.Lineage()));
-
-        return builder.build();
-    }
-
-    private void pollLineageTopic(ExecutorService service, String bootstrapServers) {
+    private void pollDestinationTopic(ExecutorService service, String destTopic, String bootstrapServers) {
         Properties props = new Properties();
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
-        props.put(ConsumerConfig.GROUP_ID_CONFIG, "FinalChildLineageConsumer");
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "FinalDestinationConsumer");
         props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
         props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, HierarchySerdes.LineageDeserializer.class.getName());
         Consumer<String, Lineage> consumer = new KafkaConsumer<>(props);
-        consumer.subscribe(Collections.singleton("lineage"));
+        consumer.subscribe(Collections.singleton(destTopic));
 
         service.submit(() -> {
             while (!service.isShutdown()) {
@@ -319,7 +224,7 @@ public class Runner {
         });
     }
 
-    private void startInteractiveHierarchyInput(ExecutorService service, String bootstrapServers) {
+    private void startInteractiveHierarchyInput(ExecutorService service, String sourceTopic, String destTopic, String bootstrapServers) {
         Properties props = new Properties();
         props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         props.put(ProducerConfig.ACKS_CONFIG, "all");
@@ -340,20 +245,16 @@ public class Runner {
                 }
 
                 if (childParent[0].equalsIgnoreCase("dump") && childParent.length == 2) {
-                    dumpLineage(childParent[1].equalsIgnoreCase("all"), bootstrapServers);
+                    dumpDestination(childParent[1].equalsIgnoreCase("all"), destTopic, bootstrapServers);
                 } else if (childParent.length % 2 != 0) {
                     System.out.println("Must provide a parent for every child");
                 } else {
                     for (int i=0; i < childParent.length; i += 2) {
-                        if (childParent[i].equals(childParent[i+1])) {
-                            System.out.println(childParent[i] + " cannot be its own parent");
-                        } else {
-                            try {
-                                producer.send(new ProducerRecord<>("child-parent", childParent[i], childParent[i+1])).get();
-                                System.out.println("Parent of " + childParent[i] + " set to " + childParent[i+1]);
-                            } catch (Exception e) {
-                                _log.error("Failed to send record", e);
-                            }
+                        try {
+                            producer.send(new ProducerRecord<>(sourceTopic, childParent[i], childParent[i+1])).get();
+                            System.out.println("Parent of " + childParent[i] + " set to " + childParent[i+1]);
+                        } catch (Exception e) {
+                            _log.error("Failed to send record", e);
                         }
                     }
                 }
@@ -363,8 +264,8 @@ public class Runner {
         });
     }
 
-    private void dumpLineage(boolean full, String bootstrapServers) {
-        String groupId = "DumpLineage-" + UUID.randomUUID();
+    private void dumpDestination(boolean full, String destTopic, String bootstrapServers) {
+        String groupId = "DumpDest-" + UUID.randomUUID();
         Properties props = new Properties();
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
@@ -373,9 +274,9 @@ public class Runner {
         props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
 
         Consumer<String, Lineage> consumer = new KafkaConsumer<>(props);
-        consumer.subscribe(Collections.singleton("lineage"));
+        consumer.subscribe(Collections.singleton(destTopic));
 
-        System.out.println("Dumping all lineage records...");
+        System.out.println("Dumping all destination records...");
         ConsumerRecords<String, Lineage> records;
         Map<String, List<String>> parents = new HashMap<>();
         while (!(records = consumer.poll(5000)).isEmpty()) {
@@ -386,16 +287,8 @@ public class Runner {
             }
         }
         parents.forEach((id, lineage) -> System.out.println(String.format("ID %s has parents %s", id, lineage)));
-        System.out.println("End lineage dump");
+        System.out.println("End destination dump");
 
         consumer.unsubscribe();
-    }
-
-    private static String parentOrRoot(String parentId) {
-        return Optional.ofNullable(parentId).orElse(ROOT);
-    }
-
-    private static boolean isRoot(String id) {
-        return ROOT.equals(id);
     }
 }
