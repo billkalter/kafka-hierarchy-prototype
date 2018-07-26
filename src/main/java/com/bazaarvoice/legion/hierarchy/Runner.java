@@ -1,11 +1,17 @@
 package com.bazaarvoice.legion.hierarchy;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.LoggerContext;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.ConsoleAppender;
 import com.bazaarvoice.legion.hierarchy.model.ChildIdSet;
 import com.bazaarvoice.legion.hierarchy.model.ChildTransition;
 import com.bazaarvoice.legion.hierarchy.model.HierarchySerdes;
 import com.bazaarvoice.legion.hierarchy.model.Lineage;
 import com.bazaarvoice.legion.hierarchy.model.LineageTransition;
 import com.bazaarvoice.legion.hierarchy.model.ParentTransition;
+import net.manub.embeddedkafka.EmbeddedKafka$;
+import net.manub.embeddedkafka.EmbeddedKafkaConfig;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.admin.CreateTopicsResult;
@@ -38,6 +44,10 @@ import org.apache.kafka.streams.kstream.Produced;
 import org.apache.kafka.streams.kstream.Serialized;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import scala.Tuple2;
+import scala.collection.JavaConverters;
+import scala.collection.Map$;
+import scala.collection.immutable.HashMap$;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -53,6 +63,7 @@ import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 public class Runner {
@@ -66,41 +77,105 @@ public class Runner {
 
     public static void main(String args[]) {
 
+        setupLogging();
+
         Runner runner = new Runner();
 
-        try (AdminClient adminClient = runner.createAdminClient()) {
+        EmbeddedKafkaConfig embeddedKafkaConfig = EmbeddedKafkaConfig.apply(9092, 2181,
+                runner.getCustomBrokerProperties(),
+                runner.getCustomProducerProperties(),
+                runner.getCustomConsumerProperties());
 
-            runner.createTopics(adminClient);
-            KafkaStreams streams = new KafkaStreams(runner.createToplogy(), runner.createConfig());
-            streams.setUncaughtExceptionHandler((t, e) -> _log.error("Something failed", e));
-            streams.start();
-            _log.info("Streams started...");
-            
-            final ExecutorService service = Executors.newCachedThreadPool();
-            runner.pollLineageTopic(service);
-            runner.startInteractiveHierarchyInput(service);
+        final String bootstrapServers = "localhost:" + embeddedKafkaConfig.kafkaPort();
 
-            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+        EmbeddedKafka$.MODULE$.withRunningKafka(() -> {
+            try (AdminClient adminClient = runner.createAdminClient(bootstrapServers)) {
+
+                runner.createTopics(adminClient);
+                KafkaStreams streams = new KafkaStreams(runner.createToplogy(), runner.createConfig(bootstrapServers));
+                streams.setUncaughtExceptionHandler((t, e) -> _log.error("Something failed", e));
+                streams.start();
+                _log.info("Streams started...");
+
+                final ExecutorService service = Executors.newCachedThreadPool();
+                runner.pollLineageTopic(service, bootstrapServers);
+                runner.startInteractiveHierarchyInput(service, bootstrapServers);
+
+                Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                     streams.close();
                     service.shutdownNow();
-            }));
-        }
+                    EmbeddedKafka$.MODULE$.stop();
+                }));
+
+                while (!service.isShutdown()) {
+                    try {
+                        service.awaitTermination(10, TimeUnit.SECONDS);
+                    } catch (InterruptedException ignore) {
+                        // ignore
+                    }
+                }
+            }
+            return null;
+        }, embeddedKafkaConfig);
     }
 
-    private StreamsConfig createConfig() {
+    private static void setupLogging() {
+        LoggerContext loggerContext = (LoggerContext) LoggerFactory.getILoggerFactory();
+
+        ConsoleAppender<ILoggingEvent> errAppender = new ConsoleAppender<>();
+        errAppender.setTarget("System.err");
+        errAppender.setContext(loggerContext);
+
+        ConsoleAppender<ILoggingEvent> outAppender = new ConsoleAppender<>();
+        outAppender.setTarget("System.out");
+        outAppender.setContext(loggerContext);
+
+        ch.qos.logback.classic.Logger rootLogger = loggerContext.getLogger(Logger.ROOT_LOGGER_NAME);
+        rootLogger.addAppender(errAppender);
+        rootLogger.setLevel(Level.WARN);
+        rootLogger.setAdditive(true);
+
+        ch.qos.logback.classic.Logger runnerLogger = loggerContext.getLogger(Runner.class);
+        runnerLogger.addAppender(outAppender);
+        runnerLogger.setLevel(Level.INFO);
+        runnerLogger.setAdditive(true);
+
+        loggerContext.start();
+    }
+    
+    private scala.collection.immutable.Map<String, String> getCustomBrokerProperties() {
+        Map<String, String> props = new HashMap<>();
+        props.put("broker.id", "0");
+        props.put("num.network.threads", "3");
+        props.put("num.io.threads", "8");
+        props.put("num.partitions", "1");
+
+        return HashMap$.MODULE$.apply(JavaConverters.asScalaBuffer(
+                props.entrySet().stream().map(e -> new Tuple2<>(e.getKey(), e.getValue())).collect(Collectors.toList())));
+    }
+
+    private scala.collection.immutable.Map<String, String> getCustomProducerProperties() {
+        return Map$.MODULE$.empty();
+    }
+
+    private scala.collection.immutable.Map<String, String> getCustomConsumerProperties() {
+        return Map$.MODULE$.empty();
+    }
+
+    private StreamsConfig createConfig(String bootstrapServers) {
         Properties settings = new Properties();
-        settings.put(StreamsConfig.APPLICATION_ID_CONFIG, "category-hierarchy-prototype");
-        settings.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        settings.put(StreamsConfig.APPLICATION_ID_CONFIG, "category-hierarchy-prototype-" + System.currentTimeMillis());
+        settings.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         settings.put(StreamsConfig.REPLICATION_FACTOR_CONFIG, 1);
+        settings.put(StreamsConfig.POLL_MS_CONFIG, 100);
+        settings.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 500);
         settings.put(StreamsConfig.producerPrefix(ProducerConfig.ACKS_CONFIG), "all");
-        settings.put(StreamsConfig.POLL_MS_CONFIG, 10);
-        settings.put(StreamsConfig.STATE_DIR_CONFIG, "/Users/bill.kalter/work/kafka-hierarchy-prototype/target/state/kstream-state");
         return new StreamsConfig(settings);
     }
 
-    private AdminClient createAdminClient() {
+    private AdminClient createAdminClient(String bootstrapServers) {
         Properties props = new Properties();
-        props.setProperty(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        props.setProperty(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         return AdminClient.create(props);
     }
 
@@ -223,9 +298,9 @@ public class Runner {
         return builder.build();
     }
 
-    private void pollLineageTopic(ExecutorService service) {
+    private void pollLineageTopic(ExecutorService service, String bootstrapServers) {
         Properties props = new Properties();
-        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         props.put(ConsumerConfig.GROUP_ID_CONFIG, "FinalChildLineageConsumer");
         props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
         props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, HierarchySerdes.LineageDeserializer.class.getName());
@@ -244,9 +319,9 @@ public class Runner {
         });
     }
 
-    private void startInteractiveHierarchyInput(ExecutorService service) {
+    private void startInteractiveHierarchyInput(ExecutorService service, String bootstrapServers) {
         Properties props = new Properties();
-        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         props.put(ProducerConfig.ACKS_CONFIG, "all");
         props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
         props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
@@ -259,20 +334,28 @@ public class Runner {
             System.out.println("> ");
             while (!service.isShutdown() && !(line = scanner.nextLine()).trim().equalsIgnoreCase("quit")) {
                 String[] childParent = line.split("\\s");
-                if (childParent.length != 2) {
-                    System.out.println("Must provide child and parent");
-                } else if (childParent[0].equals(childParent[1])) {
-                    System.out.println("Child cannot be its own parent");
-                } else if (childParent[0].equalsIgnoreCase("dump")) {
-                    dumpLineage(childParent[1].equalsIgnoreCase("all"));
-                } else {
-                    try {
-                        producer.send(new ProducerRecord<>("child-parent", childParent[0], childParent[1])).get();
-                        System.out.println("Parent of " + childParent[0] + " set to " + childParent[1]);
-                    } catch (Exception e) {
-                        _log.error("Failed to send record", e);
-                    }
+                if (childParent.length == 1 && childParent[0].equalsIgnoreCase("dump")) {
+                    // Convert to dump latest
+                    childParent = new String[] { "dump", "latest" };
+                }
 
+                if (childParent[0].equalsIgnoreCase("dump") && childParent.length == 2) {
+                    dumpLineage(childParent[1].equalsIgnoreCase("all"), bootstrapServers);
+                } else if (childParent.length % 2 != 0) {
+                    System.out.println("Must provide a parent for every child");
+                } else {
+                    for (int i=0; i < childParent.length; i += 2) {
+                        if (childParent[i].equals(childParent[i+1])) {
+                            System.out.println(childParent[i] + " cannot be its own parent");
+                        } else {
+                            try {
+                                producer.send(new ProducerRecord<>("child-parent", childParent[i], childParent[i+1])).get();
+                                System.out.println("Parent of " + childParent[i] + " set to " + childParent[i+1]);
+                            } catch (Exception e) {
+                                _log.error("Failed to send record", e);
+                            }
+                        }
+                    }
                 }
                 System.out.print("> ");
             }
@@ -280,10 +363,10 @@ public class Runner {
         });
     }
 
-    private void dumpLineage(boolean full) {
+    private void dumpLineage(boolean full, String bootstrapServers) {
         String groupId = "DumpLineage-" + UUID.randomUUID();
         Properties props = new Properties();
-        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
         props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
         props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, HierarchySerdes.LineageDeserializer.class.getName());
@@ -294,15 +377,15 @@ public class Runner {
 
         System.out.println("Dumping all lineage records...");
         ConsumerRecords<String, Lineage> records;
-        while (!(records = consumer.poll(1000)).isEmpty()) {
+        Map<String, List<String>> parents = new HashMap<>();
+        while (!(records = consumer.poll(5000)).isEmpty()) {
             if (full) {
                 records.forEach(record -> System.out.println(String.format("ID %s has parents %s", record.key(), record.value().getLinage())));
             } else {
-                Map<String, List<String>> parents = new HashMap<>();
                 records.forEach(record -> parents.put(record.key(), record.value().getLinage()));
-                parents.forEach((id, lineage) -> System.out.println(String.format("ID %s has parents %s", id, lineage)));
             }
         }
+        parents.forEach((id, lineage) -> System.out.println(String.format("ID %s has parents %s", id, lineage)));
         System.out.println("End lineage dump");
 
         consumer.unsubscribe();
